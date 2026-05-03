@@ -1,11 +1,3 @@
-/**
- * Iqra — Secure Backend Proxy
- * Node.js + Express · Deployed on Vercel
- *
- * The API key NEVER leaves this server.
- * The Chrome extension sends page content here,
- * this server calls the AI, and returns the summary.
- */
 
 'use strict';
 
@@ -114,7 +106,7 @@ async function callGemini(prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server.');
 
-  const model = 'gemini-2.5-flash-preview-05-20';
+  const model = 'gemini-2.5-flash';
   const url   = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
 
   const res = await fetch(url, {
