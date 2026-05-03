@@ -8,15 +8,13 @@ const app = express();
 
 // ── Config ──────────────────────────────────────────────────
 const PORT            = process.env.PORT || 3000;
-const CONTENT_MAX     = 10000;   // max chars sent to AI
-const RATE_WINDOW_MS  = 60000;   // 1 minute
-const RATE_LIMIT_MAX  = 20;      // requests per IP per minute
+const CONTENT_MAX     = 10000;
+const RATE_WINDOW_MS  = 60000;
+const RATE_LIMIT_MAX  = 20;
 
 // ── CORS ────────────────────────────────────────────────────
-// Only allow requests from Chrome extensions
 app.use(cors({
   origin: (origin, cb) => {
-    // Allow Chrome extensions (chrome-extension://) and local dev
     if (!origin || origin.startsWith('chrome-extension://') || origin === 'null') {
       cb(null, true);
     } else {
@@ -29,7 +27,7 @@ app.use(cors({
 
 app.use(express.json({ limit: '50kb' }));
 
-// ── In-memory rate limiter ──────────────────────────────────
+// ── Rate Limiter ─────────────────────────────────────────────
 const rateLimitMap = new Map();
 
 function rateLimit(req, res, next) {
@@ -43,13 +41,9 @@ function rateLimit(req, res, next) {
 
   if (timestamps.length > RATE_LIMIT_MAX) {
     const waitSecs = Math.ceil((RATE_WINDOW_MS - (now - timestamps[0])) / 1000);
-    return res.status(429).json({
-      ok:    false,
-      error: `Rate limit reached. Please wait ${waitSecs}s.`
-    });
+    return res.status(429).json({ ok: false, error: `Rate limit reached. Please wait ${waitSecs}s.` });
   }
 
-  // Clean up old IPs every 5 minutes
   if (Math.random() < 0.01) {
     for (const [key, tsList] of rateLimitMap.entries()) {
       if (tsList.every(ts => now - ts > RATE_WINDOW_MS)) rateLimitMap.delete(key);
@@ -59,23 +53,18 @@ function rateLimit(req, res, next) {
   next();
 }
 
-// ── Optional token guard ────────────────────────────────────
-// Set IQRA_SECRET in Vercel env vars to restrict access to your extension only
+// ── Token Guard ──────────────────────────────────────────────
 function tokenGuard(req, res, next) {
   const secret = process.env.IQRA_SECRET;
-  if (!secret) return next(); // no secret set — open (fine for demo)
-
+  if (!secret) return next();
   const token = req.headers['x-iqra-token'];
-  if (token !== secret) {
-    return res.status(401).json({ ok: false, error: 'Unauthorized.' });
-  }
+  if (token !== secret) return res.status(401).json({ ok: false, error: 'Unauthorized.' });
   next();
 }
 
-// ── Prompt Builder ──────────────────────────────────────────
+// ── Prompt Builder ───────────────────────────────────────────
 function buildPrompt(content, mode, wordCount, readingTime) {
   const truncated = content.slice(0, CONTENT_MAX);
-
   const modeInstructions = {
     full:       'Provide 4 to 6 comprehensive key insights. Each should be a complete, informative sentence.',
     '3bullets': 'Provide exactly 3 concise, high-impact bullet points capturing the most important takeaways.',
@@ -89,9 +78,7 @@ Page content (${wordCount} words, ~${readingTime} min read):
 ${truncated}
 ---
 
-CRITICAL: Respond ONLY with a single valid JSON object. No markdown, no preamble — just raw JSON.
-
-Required format:
+You MUST respond ONLY with a valid JSON object in this exact format, nothing else:
 {"insights":["sentence 1","sentence 2","sentence 3"],"readingTime":${readingTime},"wordCount":${wordCount},"keyPhrases":["phrase1","phrase2","phrase3"]}
 
 Rules:
@@ -101,7 +88,7 @@ Rules:
 - "wordCount": use ${wordCount}`;
 }
 
-// ── AI Callers ──────────────────────────────────────────────
+// ── Gemini 2.5 Flash ─────────────────────────────────────────
 async function callGemini(prompt) {
   const apiKey = process.env.GEMINI_API_KEY;
   if (!apiKey) throw new Error('GEMINI_API_KEY not configured on server.');
@@ -113,8 +100,15 @@ async function callGemini(prompt) {
     method:  'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify({
-      contents:         [{ parts: [{ text: prompt }] }],
-      generationConfig: { maxOutputTokens: 1024, temperature: 0.3 }
+      contents: [{ parts: [{ text: prompt }] }],
+      generationConfig: {
+        maxOutputTokens: 1024,
+        temperature: 0.3,
+        responseMimeType: 'application/json'
+      },
+      thinkingConfig: {
+        thinkingBudget: 0
+      }
     })
   });
 
@@ -126,6 +120,7 @@ async function callGemini(prompt) {
   return data.candidates?.[0]?.content?.parts?.[0]?.text || '';
 }
 
+// ── Anthropic (fallback) ─────────────────────────────────────
 async function callAnthropic(prompt) {
   const apiKey = process.env.ANTHROPIC_API_KEY;
   if (!apiKey) throw new Error('ANTHROPIC_API_KEY not configured on server.');
@@ -152,6 +147,7 @@ async function callAnthropic(prompt) {
   return data.content?.[0]?.text || '';
 }
 
+// ── OpenAI (fallback) ────────────────────────────────────────
 async function callOpenAI(prompt) {
   const apiKey = process.env.OPENAI_API_KEY;
   if (!apiKey) throw new Error('OPENAI_API_KEY not configured on server.');
@@ -159,7 +155,7 @@ async function callOpenAI(prompt) {
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method:  'POST',
     headers: { 'Content-Type': 'application/json', 'Authorization': `Bearer ${apiKey}` },
-    body:    JSON.stringify({
+    body: JSON.stringify({
       model:      'gpt-4o-mini',
       max_tokens: 1024,
       messages:   [{ role: 'user', content: prompt }]
@@ -174,9 +170,12 @@ async function callOpenAI(prompt) {
   return data.choices?.[0]?.message?.content || '';
 }
 
-// ── Response Parser ─────────────────────────────────────────
+// ── Response Parser ──────────────────────────────────────────
 function parseAIResponse(raw) {
-  let text  = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+  // Strip any markdown fences just in case
+  let text = raw.replace(/```json\s*/gi, '').replace(/```\s*/g, '').trim();
+
+  // Extract first JSON object found
   const match = text.match(/\{[\s\S]*\}/);
   if (!match) throw new Error('AI returned unexpected format.');
 
@@ -188,7 +187,6 @@ function parseAIResponse(raw) {
     throw new Error('AI returned empty summary.');
   }
 
-  // Sanitize all strings — prevent XSS if ever rendered as HTML
   const sanitize = s => String(s).replace(/</g, '&lt;').replace(/>/g, '&gt;').slice(0, 500);
 
   return {
@@ -201,53 +199,43 @@ function parseAIResponse(raw) {
   };
 }
 
-// ── Routes ──────────────────────────────────────────────────
+// ── Routes ───────────────────────────────────────────────────
 
 // Health check
 app.get('/', (_req, res) => {
   res.json({ ok: true, service: 'Iqra AI Summarizer Backend', version: '1.0.0' });
 });
 
-// Main summarize endpoint
+// Summarize endpoint
 app.post('/api/summarize', rateLimit, tokenGuard, async (req, res) => {
   try {
     const { content, mode, wordCount, readingTime } = req.body;
 
-    // Input validation
-    if (!content || typeof content !== 'string') {
+    if (!content || typeof content !== 'string')
       return res.status(400).json({ ok: false, error: 'Missing or invalid content.' });
-    }
-    if (content.trim().length < 50) {
+    if (content.trim().length < 50)
       return res.status(400).json({ ok: false, error: 'Content too short to summarize.' });
-    }
-    if (content.length > 50000) {
+    if (content.length > 50000)
       return res.status(400).json({ ok: false, error: 'Content too long.' });
-    }
 
-    const safeMode = ['full', '3bullets', 'quotes'].includes(mode) ? mode : 'full';
+    const safeMode  = ['full', '3bullets', 'quotes'].includes(mode) ? mode : 'full';
     const safeWords = Math.max(0, parseInt(wordCount) || 0);
     const safeTime  = Math.max(1, parseInt(readingTime) || 1);
 
-    // Build prompt
     const prompt = buildPrompt(content, safeMode, safeWords, safeTime);
 
-    // Try providers in order of preference based on available env vars
     let rawText = '';
     if      (process.env.GEMINI_API_KEY)    rawText = await callGemini(prompt);
     else if (process.env.ANTHROPIC_API_KEY) rawText = await callAnthropic(prompt);
     else if (process.env.OPENAI_API_KEY)    rawText = await callOpenAI(prompt);
-    else throw new Error('No AI provider API key configured on server. Add GEMINI_API_KEY to Vercel environment variables.');
+    else throw new Error('No AI provider API key configured on server.');
 
-    // Parse + return
     const result = parseAIResponse(rawText);
     return res.json({ ok: true, data: result });
 
   } catch (err) {
     console.error('[Iqra] Summarize error:', err.message);
-    return res.status(500).json({
-      ok:    false,
-      error: err.message || 'Internal server error.'
-    });
+    return res.status(500).json({ ok: false, error: err.message || 'Internal server error.' });
   }
 });
 
